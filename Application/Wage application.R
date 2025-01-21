@@ -1,6 +1,6 @@
 ###############################################################################
 # Title: Censored Regression with Bootstrap Variable Selection
-# Author: [Your Name or Institution]
+# Author: Dashun Liu
 # Description: This script demonstrates a application using
 #   the PSID1976 data from the AER package. We use EM-based approaches for
 #   left-censored outcomes, plot convergence, and then perform a bootstrap
@@ -14,8 +14,6 @@ library(glmnet)      # Regularized regression
 library(relliptical) # Functions for elliptical distributions, including EM.NormalCens
 library(caret)       # Utility functions (e.g., data splitting, pre-processing)
 library(latex2exp)   # LaTeX expressions in plots
-library(rslurm)      # Parallelization via Slurm (optional)
-library(parallel)    # Base R parallelization
 library(AER)         # Contains the PSID1976 dataset
 library(ggplot2)     # Plotting
 library(zoo)         # Rolling functions (rollmean, etc.)
@@ -38,21 +36,225 @@ X <- wage[, -c(1, 7, 8)]  # Remove 'wage', 'occupation', 'participation'
 X <- scale(X)             # Standardize covariates
 
 # Create censoring indicator vector: 0 = uncensored, 1 = censored
-# (Based on the user's code, 428 zeroes, 325 ones)
+
 cc <- c(rep(0, 428), rep(1, 325))
 wage$cc <- cc
 N <- length(cc)
+
+# -----------------------------
+# Load neccessary functions
+# -----------------------------
+
+BJ.NormalCens <- function(cc, x, y, lambda=0.1, alpha=1, error = 0.00001, iter.max = 100){
+  ################################################################################
+  ## cc is a vector nx1 of left-censoring 0 = uncensoring or 1 = censoring
+  ## x is the design matrix of dimension nxp
+  ## y vector of responses nx1
+  ## alpha=1 Lasso
+  ## alpha=0 Ridge
+  ## alpha \in (0,1) elastic-net
+  ################################################################################
+  
+  p <- ncol(x)
+  n <- nrow(x)
+  
+  ## Initial values
+  
+  reg <- glmnet(x, y, lambda=lambda,family="gaussian",intercept = F, alpha=alpha)
+  beta<- reg$beta[,1] 
+  mu<- x%*%beta
+  sigma2 <- sum((y-mu)^2)/n                                             
+  
+  ################################################################################
+  ###                                     Normal 
+  ################################################################################
+  
+  cont <- 0
+  criterio <- 1
+  lkante   <- 1
+  
+  while(criterio > error){
+    
+    cont <- (cont+1)
+    
+    E01<-y
+    
+    if(sum(cc)>0)
+    { 
+      mu1<- mu[cc==1]
+      y1<- y[cc==1]
+      np<- length(mu1)
+      aux1MomW<- matrix(0,np,1)
+      
+      for(j in 1:np){
+        A1a<- mvtelliptical(-Inf, y1[j], mu[j], sigma2, "Normal", n=1e6)
+        aux1MomW[j]<-c(A1a$EY)
+      }
+      
+      
+      
+      E01[cc==1]<- aux1MomW
+      
+    }
+    
+    la.eq<-  glmnet(x, E01, lambda=lambda,family="gaussian", intercept = F, alpha=alpha)
+    beta<-la.eq$beta[,1] 
+    mu<-x%*%beta
+    sigma2<-sum((E01-mu)^2)/n		
+    
+    
+    
+    ################################################################################
+    auxpdf<-dnorm(y[cc==0], mu[cc==0], sqrt(sigma2),log = TRUE)
+    auxcdf<- pnorm((y[cc==1]- mu[cc==1])/sqrt (sigma2),log.p = TRUE)
+    lk<-sum(auxpdf)+sum(auxcdf)
+    logver<-lk
+    ################################################################################
+    
+    criterio <- abs((lk/lkante-1))
+    
+    lkante <- lk
+    
+    if (cont==iter.max){
+      criterio <- error/10
+    }
+    
+    
+  }
+  print(cont)
+  ychap<-E01 
+  teta_novo<-matrix(c(beta,sigma2),ncol=1)
+  
+  nf<-(p-length(which(beta ==0)))+1
+  
+  
+  bic<-  (-2*lk + log(n)*nf)/n
+  
+  return(list(theta=teta_novo, iter=cont,logver=logver,BIC=bic,yhat=ychap))	
+}
+
+EM.NormalCens <- function(cc, x, y, alpha=1, error = 0.00001, iter.max = 100){
+  ################################################################################
+  ## cc is a vector nx1 of left-censoring 0 = uncensoring or 1 = censoring
+  ## x is the design matrix of dimension nxp
+  ## y vector of responses nx1
+  ## alpha=1 Lasso
+  ## alpha=0 Ridge
+  ## alpha \in (0,1) elastic-net
+  ################################################################################
+  
+  p <- ncol(x)
+  n <- nrow(x)
+  
+  ## Initial values
+  
+  reg <-  glmnet(x, y, lambda=0.01,family="gaussian",intercept = F, alpha=alpha)
+  beta<- reg$beta[,1]
+  mu<- x%*%beta
+  sigma2 <- sum((y-mu)^2)/n
+  
+  lkHistory <- numeric(iter.max)
+  
+  ################################################################################
+  ###                                     Normal
+  ################################################################################
+  
+  cont <- 0
+  criterio <- 1
+  lkante   <- 1
+  
+  while(criterio > error){
+    
+    cont <- (cont+1)
+    
+    E01<-y
+    E02<-y^2
+    
+    if(sum(cc)>0)
+    {
+      mu1<- mu[cc==1]
+      y1<- y[cc==1]
+      np<- length(mu1)
+      aux1MomW<- matrix(0,np,2)
+      
+      for(j in 1:np){
+        A1a<- mvtelliptical(-Inf, y1[j], mu1[j], sigma2, "Normal", n=1e6)
+        aux1MomW[j,]<-c(A1a$EY,A1a$EYY)
+      }
+      
+      
+      
+      E01[cc==1]<- aux1MomW[,1]
+      E02[cc==1]<- aux1MomW[,2]
+    }
+    
+    
+    #lambda1<-lambda*sigma2
+    #la.eq<-  glmnet(x, E01, weights=rep(1/sigma2,n), lambda=lambda,family="gaussian", intercept = F, alpha=alpha)
+    #beta<-la.eq$beta[,1]
+    
+    mod.eta <- cv.glmnet(x, E01,  family="gaussian",intercept=FALSE,
+                         nfolds=10,
+                         alpha=alpha)
+    
+    lambda.atual.eta <- mod.eta$lambda.min
+    la.eq2.eta <- glmnet(x, E01,  lambda=lambda.atual.eta,family="gaussian",
+                         intercept=FALSE, alpha=alpha)
+    
+    beta <- matrix(as.numeric(la.eq2.eta$beta),p,1)
+    beta[which(abs(beta) < 0.00000001)] <- 0
+    mu<-x%*%beta
+    sigma2<-sum(E02-2*E01*mu+mu^2)/n
+    
+    
+    
+    ################################################################################
+    auxpdf<-dnorm(y[cc==0], mu[cc==0], sqrt(sigma2),log = TRUE)
+    auxcdf<- pnorm((y[cc==1]- mu[cc==1])/sqrt (sigma2),log.p = TRUE)
+    lk<-sum(auxpdf)+sum(auxcdf)
+    logver<-lk
+    lkHistory[cont] <- lk
+    ################################################################################
+    
+    criterio <- abs((lk/lkante-1))
+    
+    lkante <- lk
+    
+    if (cont==iter.max){
+      criterio <- error/10
+    }
+    
+    
+  }
+  #print(cont)
+  ychap<-E01
+  teta_novo<-matrix(c(beta,sigma2),ncol=1)
+  
+  nf<-(p-length(which(beta ==0)))+1
+  
+  
+  bic<-  (-2*lk + log(n)*nf)/n
+  
+  lkHistory <- lkHistory[1:cont]
+  
+  return(list(theta=teta_novo, iter=cont,logver=logver,BIC=bic,yhat=ychap,lkHistory=lkHistory))
+}
+
+
 
 # -----------------------------
 # 2. Fit EM Model and Plot Convergence
 # -----------------------------
 set.seed(123)  # For reproducibility
 
-# EM fit with alpha = 1 ( Normal distribution ), error tolerance, and max iterations
+# EM fit with alpha = 1 ( Normal distribution )
 estEM <- EM.NormalCens(cc = cc, x = X, y = y,
                        alpha = 1,
                        error = 1e-6,
                        iter.max = 1000)
+
+
+
 
 # Extract log-likelihood history from the EM fit
 ll_history <- estEM$lkHistory
@@ -60,85 +262,136 @@ ll_history <- estEM$lkHistory
 # Convergence Plots
 par(mfrow = c(1, 2))
 
-# Plot of the first 100 iterations
-plot(ll_history[1:100], type = 'l',
-     xlab = 'Iteration', ylab = 'Log-Likelihood',
-     main = 'Log-Likelihood (First 100 iterations)')
-lines(lowess(1:100, ll_history[1:100]), col = "red", lwd = 2)
-
 # Full iteration history
 plot(ll_history, type = 'l',
      xlab = 'Iteration', ylab = 'Log-Likelihood',
      main = 'Log-Likelihood (Full Iteration)')
-lines(lowess(seq_along(ll_history), ll_history), col = "red", lwd = 2)
 
-# Optional: Rolling mean plot
+df_ll <- data.frame(
+  Iteration = seq_along(ll_history),
+  LogLik    = ll_history
+)
+p11 <- ggplot(df_ll, aes(x = Iteration, y = LogLik)) +
+  geom_line() +
+  labs(
+    x = "Iteration",
+    y = "Log-Likelihood"
+  ) +
+  theme_minimal()
 
-par(mfrow = c(1, 1))
-roll_ll <- rollmean(ll_history, k = 10, fill = NA)
-plot(roll_ll, type = "l",
-     main = "Rolling Mean of Log-Likelihood (window=10)",
-     xlab = "Iteration", ylab = "Rolling Mean of LL")
-lines(lowess(seq_along(ll_history), ll_history), col = "red", lwd = 2)
 
+
+#### BIC plot for BJ
+
+aa<-seq(0.0001,0.3,length.out=50)
+
+BICc<-matrix(0,length(aa),1)
+k<-0
+est<-list()
+
+for (j in aa){
+  k<-k+1
+  est[[k]]<-BJ.NormalCens(cc, X,y, lambda=aa[k], alpha=1, error = 0.000001, iter.max = 1000)
+  BICc[k]<-est[[k]]$BIC
+} 
+
+p1=data.frame(cbind(aa,BICc))
+mlam = aa[BICc==min(BICc)]
+
+p2 <- ggplot(p1, aes(x = aa, y = BICc)) +
+  geom_line() +
+  geom_point() +
+  geom_vline(xintercept = mlam, color = "red", linetype = "dashed") +
+  geom_smooth(method = "loess", color = "blue", se = FALSE) +
+  labs(
+    x = expression(lambda),
+    y = "BIC"
+  ) +
+  theme_minimal()
+
+
+
+library(patchwork)
+p11+p2
 
 
 # -----------------------------
 # 3. Bootstrap for Variable Selection
 # -----------------------------
-set.seed(123)  # For reproducibility
 
-B <- 30 # Number of bootstrap replications
 
-# Candidate variable names (columns of X)
-candidate_vars <- colnames(X)
 
-# Track how many times each variable is "selected"
+# 1. Split indices by censoring status
+censored_data <- wage[1:428, ] # First 428 are censored
+uncensored_data <- wage[429:753, ]  # Remaining are uncensored
+
+# 2. Number of bootstrap iterations
+B <- 30 # Adjust as needed
+
+# 3. Set up containers
+candidate_vars <- colnames(X)[-19]
 selected_count <- setNames(numeric(length(candidate_vars)), candidate_vars)
 
+# 4. Stratified bootstrap loop
+set.seed(123)
+
+aa=Sys.time()
+
 for (i in seq_len(B)) {
-  # 1. Bootstrap indices
-  boot_idx <- sample(seq_len(N), size = N, replace = TRUE)
   
-  # 2. Bootstrap sample
-  data_boot <- wage[boot_idx, ]
-  cc_boot   <- data_boot$cc
-  y_boot    <- data_boot$wage
+  # Bootstrapping censored data
+  censored_indices <- sample(1:nrow(censored_data), size = nrow(censored_data), replace = TRUE)
+  censored_sample <- censored_data[censored_indices, ]
   
-  # Drop wage, occupation, participation, cc columns
-  X_boot <- data_boot[, -c(1, 7, 8, 22)]
-  X_boot <- scale(X_boot)
+  # Bootstrapping uncensored data
+  uncensored_indices <- sample(1:nrow(uncensored_data), size = nrow(uncensored_data), replace = TRUE)
+  uncensored_sample <- uncensored_data[uncensored_indices, ]
   
-  # 3. Fit selection algorithm with your chosen function (BJ, EM, or minBIC).
-  #    Example: Using the BJ.NormalCens approach with alpha = 1.
+
+  # c) Create bootstrap sample
+  data_boot <- rbind(censored_sample, uncensored_sample)
+  
+
+  
+  # Re-extract cc, y, X from the bootstrap sample
+  cc_boot <- data_boot$cc
+  y_boot  <- data_boot$wage
+  X_boot  <- data_boot[, -c(1,7,8,22)]  
+  X_boot  <- scale(X_boot)
+  
+
   est_boot <- EM.NormalCens(cc_boot, X_boot, y_boot,
-                            alpha = 1,
-                            error = 1e-6,
-                            iter.max = 1000)
+                             alpha = 1,
+                             error = 1e-5,
+                             iter.max = 1000)
+   estimates <- est_boot$theta[-19]
   
-  # Remove intercept from the selection criterion if needed
-  estimates <- est_boot$theta[-19]  # Adjust index as appropriate
+   
+
   
-  # 4. Identify variables considered "selected"
-  #    e.g., those with absolute value > 0.00001
-  selected_vars <- candidate_vars[abs(estimates) > 1e-5]
-  
-  # 5. Update selection counts
+  # e) Which variables are "selected"?
+  selected_vars <- candidate_vars[abs(estimates) > 0]
+
+  # f) Update selection counts
   for (v in selected_vars) {
     selected_count[v] <- selected_count[v] + 1
   }
+
 }
 
-# Selection proportions
-selected_prop <- selected_count / B
-print("Selection proportions across the bootstrap:")
+
+
+bb=Sys.time()
+bb-aa
+# 5. Compute selection proportions
+selected_prop <- selected_count/ B
 selected_prop
+
 
 # -----------------------------
 # 4. Fit Final Model on Chosen Covariates
 # -----------------------------
-# Example: Suppose we select columns 1, 2, 5, 11, 16 from X
-# (Adjust based on your own selection logic or the results from 'selected_prop')
+
 chosen_cols <- c(1, 2, 5, 11, 16)
 x1 <- cbind(1, X[, chosen_cols])  # Add intercept column
 
