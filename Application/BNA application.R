@@ -31,7 +31,7 @@ BNA <- read.csv("BNA.txt", sep = "")
 # Response: Y
 
 y <- log10(BNA$Y)
-y <- scale(y)
+
 
 # Covariates: columns 6 to 60
 X <- BNA[, 6:60]
@@ -50,52 +50,68 @@ BNA$cc <- cc
 # -----------------------------
 # 2. Bootstrap for Variable Selection
 # -----------------------------
-set.seed(123)  # for reproducibility
 
-B <- 300  # Number of bootstrap resamples
+# 1. Split indices by censoring status
+idx_cc0 <- which(BNA$cc == 0)  # e.g., uncensored
+idx_cc1 <- which(BNA$cc == 1)  # e.g., censored
 
-candidate_vars <- colnames(X)  # variable names in the model
+n_cc0 <- length(idx_cc0)  # number of uncensored rows
+n_cc1 <- length(idx_cc1)  # number of censored rows
+
+# 2. Number of bootstrap iterations
+B <- 30  # Adjust as needed
+
+# 3. Set up containers
+candidate_vars <- colnames(X)
 selected_count <- setNames(numeric(length(candidate_vars)), candidate_vars)
 
+# 4. Stratified bootstrap loop
+set.seed(123)
 
+aa=Sys.time()
 
 for (i in seq_len(B)) {
-  # (a) Resample indices (with replacement)
-  boot_idx <- sample(seq_len(N), size = N, replace = TRUE)
   
-  # (b) Create bootstrap sample
+  # a) Sample within each group, maintaining original group sizes
+  boot_idx0 <- sample(idx_cc0, size = n_cc0, replace = TRUE)  # uncensored
+  boot_idx1 <- sample(idx_cc1, size = n_cc1, replace = TRUE)  # censored
+  
+  # b) Combine the two groups
+  boot_idx  <- c(boot_idx0, boot_idx1)
+  
+  # c) Create bootstrap sample
   data_boot <- BNA[boot_idx, ]
-  
-  # Preprocess the bootstrap sample
+
+  # Re-extract cc, y, X from the bootstrap sample
   cc_boot <- data_boot$cc
-  y_boot  <- log10(data_boot$Y)  # log10 transform
-  y_boot  <- scale(y_boot)       # standardize
-  X_boot  <- scale(as.matrix(data_boot[, 6:60]))
-  
-  # (c) Run selection algorithm
-
-     est_boot <- EM.NormalCens(cc_boot, X_boot, y_boot,
-                               alpha = 1,      # Normal distribution
-                               error = 1e-6,
-                               iter.max = 1000)
-     
-     
-     estimates <- est_boot$theta[-56]
-
-  selected_vars <- candidate_vars[abs(estimates) > 1e-5]
+  y_boot  <- data_boot$Y
+  X_boot  <- data_boot[, 6:60]  
+  X_boot  <- scale(X_boot)
   
 
+   est_boot <- EM.NormalCens(cc_boot, X_boot, y_boot,
+                             alpha = 1,
+                             error = 1e-5,
+                             iter.max = 1000)
+   estimates <- est_boot$theta[-56]
+  
+
+  
+  # e) Which variables are "selected"?
+  selected_vars <- candidate_vars[estimates != 0]
+  
+  # f) Update selection counts
   for (v in selected_vars) {
     selected_count[v] <- selected_count[v] + 1
   }
 }
 
-
-
-# (f) Compute selection proportions
+bb=Sys.time()
+bb-aa
+# 5. Compute selection proportions
 selected_prop <- selected_count / B
-cat("\nSelection proportions:\n")
-print(selected_prop)
+selected_prop
+
 
 # -----------------------------
 # 3. Summarize/Save Results
@@ -110,51 +126,110 @@ cat("\nVariables with selection proportion > 0.5:\n")
 print(df_selected)
 
 
+#################   boots   traping  for BJ    ######################
+
+censored_data <- BNA[which(cc==1), ] 
+uncensored_data <- BNA[which(cc!=1), ]  
+
+
+set.seed(123)  # For reproducibility
+
+# Number of bootstrap samples
+R <- 30
+
+
+
+BJboot=matrix(0,R,55)
+
+time1=Sys.time()
+for (i in 1:R) {
+  # Bootstrapping censored data
+  censored_indices <- sample(1:nrow(censored_data), size = nrow(censored_data), replace = TRUE)
+  censored_sample <- censored_data[censored_indices, ]
+  
+  # Bootstrapping uncensored data
+  uncensored_indices <- sample(1:nrow(uncensored_data), size = nrow(uncensored_data), replace = TRUE)
+  uncensored_sample <- uncensored_data[uncensored_indices, ]
+  
+  # Combine censored and uncensored data
+  boots <- rbind(censored_sample, uncensored_sample)
+  
+  y=boots$Y
+  y=log10(y)
+  #y=scale(y)
+  X=boots[,6:60]
+  X=as.matrix(X)
+  X=scale(X)
+  cc=boots$cc
+
+  ###BJ
+  aa<-seq(0.1,0.4,length.out=30)
+  BICc<-matrix(0,length(aa),1)
+  k<-0
+  est<-list()
+  
+  for (j in aa){
+    k<-k+1
+    est[[k]]<-BJ.NormalCens(cc, X,y, lambda=aa[k], alpha=1, error = 0.000001, iter.max = 1000)
+    BICc[k]<-est[[k]]$BIC
+  } 
+  
+  mlam = aa[BICc==min(BICc)]
+  #select variable
+  estBJ=BJ.NormalCens(cc, X,y, lambda=mlam, alpha=1, error = 0.000001, iter.max = 1000)
+  
+  BJboot[i,]=(abs(estBJ$theta[-56])>0.00001)+0
+  
+  
+  
+  
+}
+apply(BJboot, 2, mean)*100
 # -----------------------------
-# 4. Fit/Check Model Convergence 
+# 4. Prediction results through Cross validation
 # -----------------------------
 
-estEM2 <- EM.NormalCens(cc, X, y,
-                        alpha    = 1,      # Normal
-                        error    = 1e-6,
-                        iter.max = 1000)
+set.seed(123)
+
+est   <- EM.NormalCens(cc, X, y, error = 1e-5, iter.max = 1000)
+X1    <- X[, est$theta[1:ncol(X)] != 0, drop=FALSE]  # keep selected columns
+y1    <- est$yhat
+dfr   <- data.frame(y1 = y1, X1)
+EMres <- train(y1 ~ ., data = dfr, method = "lm", trControl = ctrl)
+
+
+######BJ
+aa<-seq(0.0001,0.3,length.out=50)
+
+BICc<-matrix(0,length(aa),1)
+k<-0
+est<-list()
+
+for (j in aa){
+  k<-k+1
+  est[[k]]<-BJ.NormalCens(cc, X,y, lambda=aa[k], alpha=1, error = 0.000001, iter.max = 1000)
+  BICc[k]<-est[[k]]$BIC
+} 
+
+###minimum lambda
+
+mlam = aa[BICc==min(BICc)]
+
+#select variable
+
+estBJ=BJ.NormalCens(cc, X,y, lambda=mlam, alpha=1, error = 0.000001, iter.max = 1000)
+
+ctrl <- trainControl(method = "cv", number = 20)
+
+x1=X[, estBJ$theta[1:ncol(X)] != 0, drop=FALSE]
+y1<- estBJ$yhat
+dfr<-data.frame(y1=y1,X=x1)
+
+BJ.res <- train(y1 ~., data = dfr, method = "lm", trControl = ctrl)
 
 
 
+c(BJ.res$results$RMSE, BJ.res$results$Rsquared,BJ.res$results$MAE)
+c(EMres$results$RMSE, EMres$results$Rsquared, EMres$results$MAE)
 
-# Plot log-likelihood history
-temp <- estEM2$lkHistory[1:100]
-plot(temp, type = 'l',
-     ylab = 'Log-likelihood', xlab = 'Iteration',
-     main = 'Log-likelihood (first 100 iterations)')
-lines(lowess(1:length(temp), temp), col = "red", lwd = 2)
-
-plot(estEM2$lkHistory, type = 'l',
-     ylab = 'Log-likelihood', xlab = 'Iteration',
-     main = 'Log-likelihood (full iteration)')
-lines(lowess(seq_along(estEM2$lkHistory), estEM2$lkHistory), col = "red", lwd = 2)
-
-# Rolling mean
-roll_ll <- zoo::rollmean(estEM2$lkHistory, k = 10, fill = NA)
-plot(roll_ll, type = "l",
-     main = "Rolling Mean of Log-Likelihood (window=10)",
-     xlab = "Iteration", ylab = "Rolling LL")
-lines(lowess(seq_along(estEM2$lkHistory), estEM2$lkHistory), col = "red", lwd = 2)
-
-# -----------------------------
-# 5. Final Model Fit 
-# -----------------------------
-
-chosen_cols <- c(4, 8, 41, 42, 49, 50, 53)
-x1 <- cbind(1, X[, chosen_cols])  # add intercept
-
-# Fit final censored model with CensReg.SMN
-final_model <- CensReg.SMN(cc = cc,
-                           x  = x1,
-                           y  = as.vector(y),  # ensure y is a vector
-                           cens = "left",
-                           dist = "Normal",
-                           show.envelope = TRUE)
-
-summary(final_model)
 

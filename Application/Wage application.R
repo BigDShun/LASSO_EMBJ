@@ -33,8 +33,10 @@ wage$participation <- ifelse(wage$participation == 'yes', 1, 0)
 # Define response and covariates
 y <- wage$wage
 X <- wage[, -c(1, 7, 8)]  # Remove 'wage', 'occupation', 'participation'
-X <- scale(X)             # Standardize covariates
 
+                                                      
+X[-c(15,17,18)]  <- scale(X[-c(15,17,18)])
+X=as.matrix(X)
 # Create censoring indicator vector: 0 = uncensored, 1 = censored
 
 cc <- c(rep(0, 428), rep(1, 325))
@@ -194,10 +196,10 @@ EM.NormalCens <- function(cc, x, y, alpha=1, error = 0.00001, iter.max = 100){
     #beta<-la.eq$beta[,1]
     
     mod.eta <- cv.glmnet(x, E01,  family="gaussian",intercept=FALSE,
-                         nfolds=10,
+                         nfolds=20,
                          alpha=alpha)
     
-    lambda.atual.eta <- mod.eta$lambda.min
+    lambda.atual.eta <- mod.eta$lambda.1se
     la.eq2.eta <- glmnet(x, E01,  lambda=lambda.atual.eta,family="gaussian",
                          intercept=FALSE, alpha=alpha)
     
@@ -326,7 +328,7 @@ censored_data <- wage[1:428, ] # First 428 are censored
 uncensored_data <- wage[429:753, ]  # Remaining are uncensored
 
 # 2. Number of bootstrap iterations
-B <- 30 # Adjust as needed
+B <- 300 # Adjust as needed
 
 # 3. Set up containers
 candidate_vars <- colnames(X)[-19]
@@ -357,9 +359,10 @@ for (i in seq_len(B)) {
   cc_boot <- data_boot$cc
   y_boot  <- data_boot$wage
   X_boot  <- data_boot[, -c(1,7,8,22)]  
-  X_boot  <- scale(X_boot)
   
-
+  X_boot[-c(15,17,18)]  <- scale(X_boot[-c(15,17,18)])
+  X_boot=as.matrix(X_boot)
+  #X_boot  <- scale(X_boot)
   est_boot <- EM.NormalCens(cc_boot, X_boot, y_boot,
                              alpha = 1,
                              error = 1e-5,
@@ -370,7 +373,7 @@ for (i in seq_len(B)) {
 
   
   # e) Which variables are "selected"?
-  selected_vars <- candidate_vars[abs(estimates) > 0]
+  selected_vars <- candidate_vars[abs(estimates) > 0.1]
 
   # f) Update selection counts
   for (v in selected_vars) {
@@ -384,31 +387,115 @@ for (i in seq_len(B)) {
 bb=Sys.time()
 bb-aa
 # 5. Compute selection proportions
-selected_prop <- selected_count/ B
-selected_prop
+selected_prop_EM <- selected_count/ B
+selected_prop_EM*100
 
+
+#################   boots   traping  for BJ    ######################
+
+censored_data <- wage[1:428, ] # First 428 are censored
+uncensored_data <- wage[429:753, ]  # Remaining are uncensored
+
+
+set.seed(123)  # For reproducibility
+
+# Number of bootstrap samples
+R <- 3
+
+
+
+BJboot=matrix(0,R,18)
+
+for (i in 1:R) {
+  # Bootstrapping censored data
+  censored_indices <- sample(1:nrow(censored_data), size = nrow(censored_data), replace = TRUE)
+  censored_sample <- censored_data[censored_indices, ]
+  
+  # Bootstrapping uncensored data
+  uncensored_indices <- sample(1:nrow(uncensored_data), size = nrow(uncensored_data), replace = TRUE)
+  uncensored_sample <- uncensored_data[uncensored_indices, ]
+  
+  # Combine censored and uncensored data
+  boots <- rbind(censored_sample, uncensored_sample)
+  y <- boots$wage
+  X <- boots[,-c(1,7,8,22)]
+  X[-c(15,17,18)]  <- scale(X[-c(15,17,18)])
+  X=as.matrix(X)
+  cc<- c(rep(0,428),rep(1,325))
+  N<-length(cc)
+  
+  ###BJ
+  aa<-seq(0.1,0.3,length.out=40)
+  BICc<-matrix(0,length(aa),1)
+  k<-0
+  est<-list()
+  
+  for (j in aa){
+    k<-k+1
+    est[[k]]<-BJ.NormalCens(cc, X,y, lambda=aa[k], alpha=1, error = 0.000001, iter.max = 1000)
+    BICc[k]<-est[[k]]$BIC
+  } 
+  
+  mlam = aa[BICc==min(BICc)]
+  #select variable
+  estBJ=BJ.NormalCens(cc, X,y, lambda=mlam, alpha=1, error = 0.000001, iter.max = 1000)
+  
+  BJboot[i,]=(abs(estBJ$theta[-19])>0.00001)+0
+  
+  
+  
+  
+}
+
+apply(BJboot, 2, mean)*100
 
 # -----------------------------
-# 4. Fit Final Model on Chosen Covariates
+# 4. Prediction results through Cross validation
 # -----------------------------
 
-chosen_cols <- c(1, 2, 5, 11, 16)
-x1 <- cbind(1, X[, chosen_cols])  # Add intercept column
+set.seed(123)
 
-# Fit final censored regression model:
-#   - cc: censoring indicator (0=uncensored, 1=censored)
-#   - x1: design matrix with chosen covariates
-#   - y:  outcome vector
-#   - nu=3, cens="left", dist="Normal"
-#   - show.envelope="TRUE" for diagnostic plots
-final_model <- CensReg.SMN(cc, x1, y,
-                           nu = 3,
-                           cens = "left",
-                           dist = "Normal",
-                           show.envelope = TRUE)
+est   <- EM.NormalCens(cc, X, y, error = 1e-5, iter.max = 1000)
+X1    <- X[, est$theta[1:ncol(X)] != 0, drop=FALSE]  # keep selected columns
+y1    <- est$yhat
+dfr   <- data.frame(y1 = y1, X1)
+EMres <- train(y1 ~ ., data = dfr, method = "lm", trControl = ctrl)
 
-# Print final model results
-summary(final_model)
+
+######BJ
+aa<-seq(0.0001,0.3,length.out=50)
+
+BICc<-matrix(0,length(aa),1)
+k<-0
+est<-list()
+
+for (j in aa){
+  k<-k+1
+  est[[k]]<-BJ.NormalCens(cc, X,y, lambda=aa[k], alpha=1, error = 0.000001, iter.max = 1000)
+  BICc[k]<-est[[k]]$BIC
+} 
+
+###minimum lambda
+
+mlam = aa[BICc==min(BICc)]
+
+#select variable
+
+estBJ=BJ.NormalCens(cc, X,y, lambda=mlam, alpha=1, error = 0.000001, iter.max = 1000)
+
+ctrl <- trainControl(method = "cv", number = 20)
+
+x1=X[, estBJ$theta[1:ncol(X)] != 0, drop=FALSE]
+y1<- estBJ$yhat
+dfr<-data.frame(y1=y1,X=x1)
+
+BJ.res <- train(y1 ~., data = dfr, method = "lm", trControl = ctrl)
+
+
+
+c(BJ.res$results$RMSE, BJ.res$results$Rsquared,BJ.res$results$MAE)
+c(EMres$results$RMSE, EMres$results$Rsquared, EMres$results$MAE)
+
 
 ###############################################################################
 # END OF SCRIPT
